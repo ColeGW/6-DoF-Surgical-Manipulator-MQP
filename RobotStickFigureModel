@@ -1,0 +1,64 @@
+import roboticstoolbox as rtb
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # Force the use of an interactive backend
+import matplotlib.pyplot as plt
+
+# Create a 6-DOF robot using the DH convention
+# Constants: DH parameters for a 6-DOF robot
+L1 =        292 * 0.001 # 292mm to meters
+L2 =        99 * 0.001  # 99mm to meters
+L3 =        15 * 0.001  # 15mm to meters
+L4 =        14 * 0.001  # 14mm to meters
+L5 =        16 * 0.001  # 16mm to meters
+L6 =        16 * 0.001  # Motor to EE
+thetaOne =   0          # Variable
+thetaTwo =   0          # Variable
+thetaThree = 0          # Variable
+thetaFour =  0          # Variable
+thetaFive =  0          # Variable Forceps
+
+try:
+    # DH parameters: [d, a, alpha, theta]
+    DH_params = [
+        [L1, 0, np.pi/2, thetaOne],           # Link 1
+        [0, 0, -np.pi/2, thetaTwo],           # Link 2
+        [L2+L3, 0, np.pi/2, -thetaThree],      # Link 3
+        [0, 0,  np.pi/2,  np.pi/2],
+        [0, L4, np.pi/2, -thetaFour],
+        # [0, L4, np.pi/2, -thetaFour + np.pi/2],            # Link 4
+        [0, L5, 0, -thetaFive]                 # One Forcep
+    ]   
+    
+        # [theta, d, a, alpha]
+        # [-thetaOne, L1, 0, np.pi/2],           # Link 1
+        # [-thetaTwo, 0, 0, -np.pi/2],           # Link 2
+        # [-thetaThree, L2+L3, 0, np.pi/2],      # Link 3
+        # [(-thetaFour + np.pi/2), 0, L4, np.pi/2], # Link 4
+        # [-thetaFive, 0, L5, 0]                 # One Forcep
+    
+    
+    # Create the robot using DH parameters
+    robot = rtb.DHRobot([
+        rtb.RevoluteMDH(*DH_params[0]),
+        rtb.RevoluteMDH(*DH_params[1]),
+        rtb.RevoluteMDH(*DH_params[2]),
+        rtb.RevoluteMDH(*DH_params[3]),
+        rtb.RevoluteMDH(*DH_params[4]),
+        rtb.RevoluteMDH(*DH_params[5])
+    ])
+    
+    # Print the robot description
+    print(robot)
+
+    # Shoulder, elbow, wrist, wrist deflection, forcep one
+    q = [0, 0, 0, 0, 0, 0]  # Joint angles in in degrees
+    
+    robot.plot(q, block = True)
+    plt.show() 
+  
+
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+    raise e
