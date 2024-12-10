@@ -1,0 +1,649 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+################################################################################
+# WPI/KUAS 6 DoF Surgical Robot Forceps Control
+################################################################################
+
+import os
+import tkinter as tk
+from tkinter import messagebox
+import roboticstoolbox as rtb
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # Force the use of an interactive backend
+import time
+from dynamixel_sdk import *  # Uses Dynamixel SDK library
+
+
+
+if os.name == 'nt':
+    import msvcrt
+    def getch():
+        first_byte = msvcrt.getch()
+        if first_byte == b'\xe0':  # Special key prefix
+            second_byte = msvcrt.getch()  # Get the actual key
+            return first_byte + second_byte
+        return first_byte
+else:
+    import sys, tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    def getch():
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+# Control table address
+ADDR_PRO_TORQUE_ENABLE = 64
+ADDR_PRO_GOAL_PWM = 100
+ADDR_PRO_PRESENT_PWM = 124
+ADDR_PRO_OPERATING_MODE = 11
+PWM_MODE = 16
+ADDR_PRO_TEMP = 146
+ADDR_GOAL_POSITION = 116
+ADDR_PRO_PRESENT_POSITION = 132
+OPERATING_MODE_EXTENDED_POSITION = 4
+
+# Protocol version
+PROTOCOL_VERSION = 2.0
+
+# Default settings
+DXL_IDS = [1, 3, 2, 4, 5, 6]  # IDs of the 6 motors
+DXL_IDS_PWM = [1, 2, 3, 4] # IDs of the 4 motors that use PWM
+DXL_IDS_POSITION = [5, 6] # IDs of the 2 motors that use position control
+BAUDRATE = 57600
+DEVICENAME = 'COM5'
+
+TORQUE_ENABLE = 1    # Value for enabling the torque
+TORQUE_DISABLE = 0   # Value for disabling the torque
+DXL_PWM_LIMIT = 885  # Maximum PWM value 
+PWM_STEP = 50        # Increment for each key press
+POS_STEP = 90        # Increment for each key press
+
+# Position control variables
+DXL_TICKS = 4096
+TICKS_PER_DEGREE = DXL_TICKS / 360
+
+# Robot parameters
+# Create a 6-DOF robot using the DH convention
+# Constants: DH parameters for a 6-DOF robot
+L1 =        292 * 0.001 # 292mm to meters
+L2 =        99 * 0.001  # 99mm to meters
+L3 =        15 * 0.001  # 15mm to meters
+L4 =        14 * 0.001  # 14mm to meters
+L5 =        16 * 0.001  # 16mm to meters
+L6 =        16 * 0.001  # Motor to EE
+thetaOne =   0          # Variable
+thetaTwo =   0          # Variable
+thetaThree = 0          # Variable
+thetaFour =  0          # Variable
+thetaFive =  0          # Variable Forceps
+
+shoulderPulleyDriving = 31
+shoulderPulleyDriven = 157
+wristPulleyDriving = 16
+wristPulleyDriven = 172
+elbowGearDriving = 16
+elbowGearDriven = 16
+wristDeflectionDriving = 8
+wristDeflectionDriven = -8
+forcepOneDriving = 15
+forcepOneDriven = -10
+forcepTwoDriving = 15
+forcepTwoDriven = -10
+elbowTickPerDeg = 25 # 25 ticks per degree 
+
+shoulderPulleyRatio = shoulderPulleyDriving/shoulderPulleyDriven
+wristPulleyRatio = -wristPulleyDriving/wristPulleyDriven #Negative to make clockwise positive
+elbowRatio = elbowGearDriving/elbowGearDriven
+wristDeflectionRatio = wristDeflectionDriving/wristDeflectionDriven #Negative to make clockwise positive
+forcepOneRatio = forcepOneDriving/forcepOneDriven #Negative to make clockwise positive
+forcepTwoRatio = forcepTwoDriving/forcepTwoDriven #Negative to make clockwise positive
+
+#DH parameters: [d, a, alpha, theta]
+DH_params = [
+        [L1, 0, np.pi/2, thetaOne],           # Link 1
+        [0, 0, -np.pi/2, thetaTwo],           # Link 2
+        [L2+L3, 0, np.pi/2, -thetaThree],      # Link 3
+        [0, 0,  np.pi/2,  np.pi/2],
+        [0, L4, np.pi/2, -thetaFour],
+        # [0, L4, np.pi/2, -thetaFour + np.pi/2],            # Link 4
+        [0, L5, 0, -thetaFive]                 # One Forcep
+    ]  
+# Create the robot using DH parameters
+robot = rtb.DHRobot([
+        rtb.RevoluteMDH(*DH_params[0]),
+        rtb.RevoluteMDH(*DH_params[1]),
+        rtb.RevoluteMDH(*DH_params[2]),
+        rtb.RevoluteMDH(*DH_params[3]),
+        rtb.RevoluteMDH(*DH_params[4]),
+        rtb.RevoluteMDH(*DH_params[5])
+    ])
+
+#print(robot)
+
+# Set the initial joint angles
+q_home = [0, 0, 0, 0, 0, 0]  # Joint angles in in degrees   
+
+# Initialize PortHandler instance
+portHandler = PortHandler(DEVICENAME)
+
+# Initialize PacketHandler instance
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+
+# Open port
+if not portHandler.openPort():
+    print("Failed to open the port")
+    quit()
+
+# Set port baudrate
+if not portHandler.setBaudRate(BAUDRATE):
+    print("Failed to change the baudrate")
+    quit()
+
+
+# Disable Torque for all motors before setting PWM mode
+for dxl_id in DXL_IDS:
+    dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_DISABLE)
+    if dxl_comm_result != COMM_SUCCESS:
+        print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+    elif dxl_error != 0:
+        print("%s" % packetHandler.getRxPacketError(dxl_error))
+    else:
+        print(f"Dynamixel [ID:{dxl_id}] torque disabled")
+
+# Set PWM Mode for all motors
+for dxl_id in DXL_IDS_PWM:
+    dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_OPERATING_MODE, PWM_MODE)
+    if dxl_comm_result != COMM_SUCCESS:
+        print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+    elif dxl_error != 0:
+        print("%s" % packetHandler.getRxPacketError(dxl_error))
+    else:
+        print(f"Dynamixel [ID:{dxl_id}] set to PWM mode")
+        
+# Set Position Control Mode for the two motors that use it
+for dxl_id in DXL_IDS_POSITION:
+    dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_OPERATING_MODE, OPERATING_MODE_EXTENDED_POSITION)
+    if dxl_comm_result != COMM_SUCCESS:
+        print(f"Failed to set operating mode: {packetHandler.getTxRxResult(dxl_comm_result)}")
+        exit()
+    else:
+        print(f"Dynamixel [ID:{dxl_id}] set to position control mode")
+        
+# Re-enable Torque after setting PWM mode and position control mode
+for dxl_id in DXL_IDS:
+    dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_ENABLE)
+    if dxl_comm_result != COMM_SUCCESS:
+        print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+    elif dxl_error != 0:
+        print("%s" % packetHandler.getRxPacketError(dxl_error))
+    else:
+        print(f"Dynamixel [ID:{dxl_id}] torque enabled")
+
+
+# Read the current position for all motors
+current_positions_ticks = {}
+for dxl_id in DXL_IDS:
+    # Read the present position for the motor
+    current_position, dxl_comm_result, dxl_error = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRO_PRESENT_POSITION)
+    if dxl_comm_result != COMM_SUCCESS:
+        print(f"Failed to read position for motor {dxl_id}: {packetHandler.getTxRxResult(dxl_comm_result)}")
+    elif dxl_error != 0:
+        print(f"Error reading position for motor {dxl_id}: {packetHandler.getRxPacketError(dxl_error)}")
+    else:
+        # Store the position in the dictionary
+        current_positions_ticks[dxl_id] = current_position
+        print(f"Motor {dxl_id}: Current Position = {current_position} ticks")        
+
+# Initial PWM values for all motors
+dxl_goal_pwms = {dxl_id: 0 for dxl_id in DXL_IDS}
+dxl_present_pwms = {dxl_id: 0 for dxl_id in DXL_IDS}
+
+# Intial position values for all motors
+start_point_shoulder = current_positions_ticks[6]
+start_point_wrist = current_positions_ticks[5]
+
+# Save all start_points from current positions
+start_points = {key: current_positions_ticks[key] for key in current_positions_ticks}
+goal_position_ticks = {5: start_point_wrist, 6: start_point_shoulder}
+deg_goal_positions = {5: 0, 6: 0}
+
+
+def changeDegRot(degToRot):
+    global POS_STEP
+    POS_STEP = degToRot
+    print(f"POS_STEP updated to: {POS_STEP}")
+
+def handle_deg_input(event):
+    try:
+        value = int(deg_input.get())
+        if 0 <= value <= 360:
+            changeDegRot(value)
+            print(f"Valid input received: {value}")
+        else:
+            messagebox.showerror("Invalid Input", "Please enter a number between 0 and 360.")
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Please enter a valid integer.")
+
+def convert_to_degrees(motor_id, ticks):
+    # Define gear ratios and starting positions
+    gearRatio = 1
+    startPos = 0
+
+    if motor_id == 6:
+        gearRatio = shoulderPulleyRatio
+        startPos = start_point_shoulder
+    elif motor_id == 5:
+        gearRatio = wristPulleyRatio
+        startPos = start_point_wrist
+
+    # Dynamixel motor's max tick value (2^32 - 1)
+    MAX_TICKS = 4294967295
+
+    # Adjust for wraparound by normalizing ticks
+    if ticks > MAX_TICKS / 2:  # If ticks are greater than half the max value, they may have wrapped around
+        ticks -= MAX_TICKS
+
+    # Calculate degrees
+    degrees = (ticks - startPos) * gearRatio / TICKS_PER_DEGREE
+    
+    # Debugging: print out intermediate values
+    print(f"Motor ID: {motor_id}, Ticks: {ticks}, Start Pos: {startPos}")
+    print(f"Calculated Degrees: {degrees}")
+
+    # Return rounded value to avoid large decimal precision errors
+    return round(degrees)
+
+
+current_positions_degrees = {dxl_id: convert_to_degrees(dxl_id, current_positions_ticks[dxl_id]) for dxl_id in DXL_IDS_POSITION}
+
+
+# Initial temperature values for all motors
+dxl_temps = {dxl_id: 0 for dxl_id in DXL_IDS}
+
+#Function to get the current position of a motor
+def get_position(dxl_id):
+    dxl_present_position, dxl_comm_result, dxl_error = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRO_PRESENT_POSITION)
+    if dxl_comm_result == COMM_SUCCESS and dxl_error == 0:
+        pass
+        #print(f"[ID:{dxl_id}] PresentPosition:{dxl_present_position}")
+    else:
+        print(f"Error reading position for [ID:{dxl_id}]")
+    return dxl_present_position
+
+# Function to write goal position to Dynamixel
+def write_position(dxl_id, degRotate):
+    
+    gearRatio = 1
+    if dxl_id == 6:
+        gearRatio = shoulderPulleyRatio
+    elif dxl_id == 5:
+        gearRatio = wristPulleyRatio
+    deg_goal_positions[dxl_id] += degRotate   
+    current_position = get_position(dxl_id)
+    
+    if(current_position >= goal_position_ticks[dxl_id] & degRotate > 0):
+        goal_position = int(goal_position_ticks[dxl_id] + degRotate * TICKS_PER_DEGREE / gearRatio)
+    elif(current_position <= goal_position_ticks[dxl_id] & degRotate < 0):  
+        goal_position = int(goal_position_ticks[dxl_id] + degRotate * TICKS_PER_DEGREE / gearRatio) 
+    else:
+        goal_position = int(current_position + degRotate * TICKS_PER_DEGREE / gearRatio)
+
+    print("Current Position and Goal Position: ", current_position, goal_position)
+    goal_position_ticks[dxl_id] = goal_position
+    labels[dxl_id].config(text=f"Goal Position: {deg_goal_positions[dxl_id]}°")
+    # print("Current Position and Goal Position: ", current_position, goal_position)
+    dxl_comm_result, dxl_error = packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_GOAL_POSITION, goal_position)
+    if dxl_comm_result != COMM_SUCCESS:
+        print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+    elif dxl_error != 0:
+        print("%s" % packetHandler.getRxPacketError(dxl_error))
+    print(f"Set Motor {dxl_id} position to {goal_position}")
+
+# Function to write PWM value to Dynamixel
+def write_pwm(dxl_id, pwm_value):
+    dxl_comm_result, dxl_error = packetHandler.write2ByteTxRx(portHandler, dxl_id, ADDR_PRO_GOAL_PWM, pwm_value)
+    if dxl_comm_result != COMM_SUCCESS:
+        print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+    elif dxl_error != 0:
+        print("%s" % packetHandler.getRxPacketError(dxl_error))
+    print(f"Set Motor {dxl_id} PWM to {pwm_value}")
+    
+# Function to read present PWM value from Dynamixel    
+def read_present_pwm(dxl_id):    
+    dxl_present_pwm, dxl_comm_result, dxl_error = packetHandler.read2ByteTxRx(portHandler, dxl_id, ADDR_PRO_PRESENT_PWM)
+    if dxl_comm_result == COMM_SUCCESS and dxl_error == 0:
+        pass
+        #print(f"[ID:{dxl_id}] GoalPWM:{dxl_goal_pwms[dxl_id]}  PresPWM:{dxl_present_pwm}")
+    else:
+        print(f"Error reading PWM for [ID:{dxl_id}]")
+
+    return dxl_present_pwm
+
+# Function to read temperature from Dynamixel
+def read_temp(dxl_id):
+    dxl_temp, dxl_comm_result, dxl_error = packetHandler.read1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TEMP)
+    if dxl_comm_result == COMM_SUCCESS and dxl_error == 0:
+        pass
+        #print(f"[ID:{dxl_id}] Temperature: {dxl_temp}°C")
+    else:
+        print(f"Error reading temperature for [ID:{dxl_id}]")
+    return dxl_temp
+
+# Function to stop position control for a motor
+def stop_position(dxl_id):
+    current_position, dxl_comm_result, dxl_error = packetHandler.read4ByteTxRx(portHandler, dxl_id, ADDR_PRO_PRESENT_POSITION)
+    if dxl_comm_result == COMM_SUCCESS:
+        # Set current position as the goal
+        packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_GOAL_POSITION, current_position)
+        print(f"Motor {dxl_id} stopped at current position!")
+    else:
+        print(f"Failed to read or set stop for motor {dxl_id}")
+ 
+# Function to stop PWM for a motor
+def stop_motor_pwm(motor_id):
+    dxl_goal_pwms[motor_id] = 0
+    write_pwm(motor_id, 0)
+    # Check if the label exists and update it only if it does
+    if motor_id in labels and labels[motor_id].winfo_exists():
+        labels[motor_id].config(text="Present PWM: 0")
+    else:
+        print(f"Warning: Label for Motor ID {motor_id} does not exist. PWM set to 0.")
+       
+# Function to stop all motors
+def stop_all_motors():
+    for dxl_id in DXL_IDS_PWM:
+        stop_motor_pwm(dxl_id)
+    for dxl_id in DXL_IDS_POSITION:
+        stop_position(dxl_id)
+        
+def stop_all_motors_no_labels():
+    for dxl_id in DXL_IDS_PWM:
+        dxl_goal_pwms[motor_id] = 0
+        write_pwm(motor_id, 0)
+    for dxl_id in DXL_IDS_POSITION:
+        stop_position(dxl_id)
+  
+# Function to update PWM value for a motor        
+def update_pwm(motor_id, change):
+    dxl_goal_pwms[motor_id] += change
+    if dxl_goal_pwms[motor_id] > DXL_PWM_LIMIT:
+        dxl_goal_pwms[motor_id] = DXL_PWM_LIMIT
+    elif dxl_goal_pwms[motor_id] < -DXL_PWM_LIMIT:
+        dxl_goal_pwms[motor_id] = -DXL_PWM_LIMIT
+    write_pwm(motor_id, dxl_goal_pwms[motor_id])
+    labels[motor_id].config(text=f"Goal PWM: {dxl_goal_pwms[motor_id]}")            
+   
+# Function to convert unsigned PWM value to signed
+def convert_unsigned_to_signed(dxl_present_pwm):
+    # Check if the value is greater than 32767 (max positive value for 16-bit signed integer)
+    if dxl_present_pwm > 32767:
+        # Convert to signed by subtracting 65536 (2^16)
+        dxl_present_pwm -= 65536
+    return dxl_present_pwm
+
+# Function to update present PWM value for all motors
+def update_present_pwm():
+    for motor_id in DXL_IDS_PWM:
+        dxl_present_pwms[motor_id] = read_present_pwm(motor_id) 
+        dxl_temps[motor_id] = read_temp(motor_id)   
+        # Convert the read value from unsigned to signed
+        signed_pwm = convert_unsigned_to_signed(dxl_present_pwms[motor_id])
+        present_pwm_labels[motor_id].config(text=f"Present PWM: {signed_pwm}")
+        temp_labels[motor_id].config(text=f"Temperature: {dxl_temps[motor_id]}°C")
+    root.after(500, update_present_pwm)  # Refresh every 500ms
+
+# Function to update present position value for all motors
+def update_present_position():
+    for motor_id in DXL_IDS_POSITION:
+        dxl_temps[motor_id] = read_temp(motor_id)
+        current_positions_ticks[motor_id] = get_position(motor_id)
+        current_positions_degrees[motor_id] = convert_to_degrees(motor_id, current_positions_ticks[motor_id])
+        present_position_labels[motor_id].config(text=f"Present Position: {current_positions_degrees[motor_id]}°")
+        temp_labels[motor_id].config(text=f"Temperature: {dxl_temps[motor_id]}°C")
+    root.after(500, update_present_position)  # Refresh
+  
+# Function to Home Motors  
+def home_motors():
+    print("Homing Position Motors...")
+    for dxl_id in DXL_IDS:
+        dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_ENABLE)
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"Torque Enable Failed for Motor {dxl_id}: {packetHandler.getTxRxResult(dxl_comm_result)}")
+        elif dxl_error != 0:
+            print(f"Torque Enable Error for Motor {dxl_id}: {packetHandler.getRxPacketError(dxl_error)}")
+        else:
+            print(f"Torque Enabled for Motor {dxl_id}")
+
+    for dxl_id in DXL_IDS_POSITION:
+        print(f"Homing Motor {dxl_id}...")
+        goal_position = start_points[dxl_id]
+
+        dxl_comm_result, dxl_error = packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_GOAL_POSITION, goal_position)
+        if dxl_comm_result != COMM_SUCCESS:
+            print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+        elif dxl_error != 0:
+            print("%s" % packetHandler.getRxPacketError(dxl_error))
+        else:
+            print(f"Set Motor {dxl_id} position to {goal_position}")
+            while True:
+                current_position = get_position(dxl_id)
+                if current_position == goal_position or abs(current_position) <= abs(goal_position) + 10 and abs(current_position) >= abs(goal_position) - 10:
+                    break
+    
+    print("Homing PWM Motors...")
+    for dxl_id in DXL_IDS_PWM:
+        #Set PWM to 0:<
+        packetHandler.write2ByteTxRx(portHandler, dxl_id, ADDR_PRO_GOAL_PWM, 0)
+        #Disable Torque
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_DISABLE)
+        #Change to Position Mode
+        dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_OPERATING_MODE, OPERATING_MODE_EXTENDED_POSITION)
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"Failed to set operating mode: {packetHandler.getTxRxResult(dxl_comm_result)}")
+            exit()
+        else:
+            print(f"Dynamixel [ID:{dxl_id}] set to position control mode")
+        #Enable Torque
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_ENABLE)
+        print(f"Motor {dxl_id} current position: ", get_position(dxl_id))
+        #Send Home Position
+        goal_position = start_points[dxl_id]
+        dxl_comm_result, dxl_error = packetHandler.write4ByteTxRx(portHandler, dxl_id, ADDR_GOAL_POSITION, goal_position)
+        if dxl_comm_result != COMM_SUCCESS:
+            print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+        elif dxl_error != 0:
+            print("%s" % packetHandler.getRxPacketError(dxl_error))
+        else:
+            print(f"Set Motor {dxl_id} position to {goal_position}")
+            while True:
+                current_position = get_position(dxl_id)
+                if current_position == goal_position or abs(current_position) <= abs(goal_position) + 10 and abs(current_position) >= abs(goal_position) - 10:
+                    break
+        #Disable Torque
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_DISABLE)
+        #Change Back into PWM
+        dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_OPERATING_MODE, PWM_MODE)
+        if dxl_comm_result != COMM_SUCCESS:
+            print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+        elif dxl_error != 0:
+            print("%s" % packetHandler.getRxPacketError(dxl_error))
+        else:
+            print(f"Dynamixel [ID:{dxl_id}] set to PWM mode")
+        #Enable Torque
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_ENABLE)
+        print(f"Motor {dxl_id} homed")
+    print("All motors homed")
+    
+# Function to allow easier interchangeability
+def mounting():
+    direction = 1
+    start_time = time.time()
+
+    # Run for 10 seconds
+    while time.time() - start_time < 10:
+        # Loop through each DXL motor ID
+        for dxl_id in DXL_IDS_PWM:
+            write_pwm(dxl_id, 100 * direction)
+        
+        # Wait for 500ms
+        time.sleep(1)
+        
+        # Switch direction
+        direction = direction * -1
+    
+    for dxl_id in DXL_IDS_PWM:
+        stop_motor_pwm(dxl_id)  # Stop all motors
+
+qCurrent = q_home
+def updateQ():
+    #elbowCurrentPosition = get_position(4)
+    #tickDifference = elbowCurrentPosition - start_points[4]
+    #degDifference = tickDifference / elbowTickPerDeg
+    #qCurrent = [current_positions_degrees[6] * np.pi/180, degDifference, current_positions_degrees[5] * np.pi/180, 0, 0, 0]
+    qCurrent = [current_positions_degrees[6] * np.pi/180, 0, current_positions_degrees[5] * np.pi/180, 0, 0, 0]
+    robot.plot(qCurrent, backend='pyplot', block=False)
+    root.after(500, updateQ)
+
+# Set up the GUI
+screenWidth=1000    
+root = tk.Tk()
+root.title("6 DoF Surgical Robot Motor Control")
+root.geometry(f"{screenWidth}x1000")
+
+main_frame = tk.Frame(root)
+main_frame.pack(fill="both", expand=True)
+
+labels = {}
+present_pwm_labels = {}
+present_position_labels = {}
+temp_labels = {}
+
+for idx, motor_id in enumerate(DXL_IDS):
+    # Create a frame for each motor
+    frame = tk.Frame(root, borderwidth=2, relief="groove", padx=10, pady=10)
+    frame.pack(pady=10, fill="x")  # Ensure the frame spans the width
+
+    # Use an inner frame for aligning content within the motor frame
+    inner_frame = tk.Frame(frame)
+    inner_frame.pack(anchor="center")  # Center-align the content
+
+    # Motor label
+    if motor_id == 1:
+        tk.Label(inner_frame, text="Red Forcep", font=("Helvetica", 14)).grid(row=0, column=1, pady=5) 
+    elif motor_id == 2:
+        tk.Label(inner_frame, text="Wrist Deflection", font=("Helvetica", 14)).grid(row=0, column=1, pady=5)
+    elif motor_id == 3:
+        tk.Label(inner_frame, text="Other Forcep", font=("Helvetica", 14)).grid(row=0, column=1, pady=5) #Negative Opens, Positive Closes
+    elif motor_id == 4:
+        tk.Label(inner_frame, text="Elbow Rotation", font=("Helvetica", 14)).grid(row=0, column=1, pady=5)
+    elif motor_id == 5:
+        tk.Label(inner_frame, text="Wrist Rotation", font=("Helvetica", 14)).grid(row=0, column=1, pady=5)
+    elif motor_id == 6:
+        tk.Label(inner_frame, text="Shoulder Rotation", font=("Helvetica", 14)).grid(row=0, column=1, pady=5)
+    else:
+        tk.Label(inner_frame, text=f"Motor {motor_id}", font=("Helvetica", 14)).grid(row=0, column=1, pady=5)   
+
+    if motor_id in DXL_IDS_PWM:
+        # Goal PWM display
+        labels[motor_id] = tk.Label(inner_frame, text=f"Goal PWM: {dxl_goal_pwms[motor_id]}",
+                                    font=("Helvetica", 12), width=20, anchor="center")
+        labels[motor_id].grid(row=1, column=0)
+        
+        # Present PWM display
+        present_pwm_labels[motor_id] = tk.Label(inner_frame, text=f"Present PWM: {dxl_present_pwms[motor_id]}",
+                                            font=("Helvetica", 12), fg="blue", width=20, anchor="center")
+        present_pwm_labels[motor_id].grid(row=1, column=1)
+        
+    elif motor_id in DXL_IDS_POSITION: 
+        labels[motor_id] = tk.Label(inner_frame, text=f"Goal Position: {deg_goal_positions[motor_id]}°",
+                                    font=("Helvetica", 12), width=20, anchor="center")
+        labels[motor_id].grid(row=1, column=0)
+        present_position_labels[motor_id] = tk.Label(inner_frame, text=f"Present Position: {current_positions_degrees[motor_id]}°",
+                                    font=("Helvetica", 12), width=20, anchor="center")
+        present_position_labels[motor_id].grid(row=1, column=1)     
+
+    # Temperature display
+    temp_labels[motor_id] = tk.Label(inner_frame, text=f"Temperature: {dxl_temps[motor_id]}°C",
+                                        font=("Helvetica", 12), fg="red", width=20, anchor="center")
+    temp_labels[motor_id].grid(row=1, column=2)
+
+    # Buttons for Up, Down, and Stop
+    if motor_id in DXL_IDS_PWM:      
+        if motor_id == 1 or motor_id == 3:
+            tk.Button(inner_frame, text="Close", font=("Helvetica", 14), command=lambda m=motor_id: update_pwm(m, PWM_STEP)).grid(row=0, column=2, padx=10)
+            tk.Button(inner_frame, text="Open", font=("Helvetica", 14), command=lambda m=motor_id: update_pwm(m, -PWM_STEP)).grid(row=0, column=0, padx=10)
+        else:
+            tk.Button(inner_frame, text="↑", font=("Helvetica", 14), command=lambda m=motor_id: update_pwm(m, PWM_STEP)).grid(row=0, column=0, padx=10)
+            tk.Button(inner_frame, text="↓", font=("Helvetica", 14), command=lambda m=motor_id: update_pwm(m, -PWM_STEP)).grid(row=0, column=2, padx=10)
+        tk.Button(inner_frame, text="STOP", font=("Helvetica", 12), bg="red", fg="white", command=lambda m=motor_id: stop_motor_pwm(m)).grid(row=2, column=1, padx=10)
+
+    elif motor_id in DXL_IDS_POSITION:
+        tk.Button(inner_frame, text="↑", font=("Helvetica", 14), command=lambda m=motor_id: write_position(m, POS_STEP)).grid(row=0, column=0, padx=10)
+        tk.Button(inner_frame, text="↓", font=("Helvetica", 14), command=lambda m=motor_id: write_position(m, -POS_STEP)).grid(row=0, column=2, padx=10)
+        tk.Button(inner_frame, text="STOP", font=("Helvetica", 12), bg="red", fg="white", command=lambda m=motor_id: stop_position(m)).grid(row=2, column=1, padx=10)
+
+# Frame for STOP ALL button and text box
+stop_frame = tk.Frame(root)
+stop_frame.pack(pady=20, anchor="center")  # Align center horizontally
+
+# Home button
+home_btn = tk.Button(stop_frame, text="HOME", font=("Helvetica", 14), bg="green", fg="white", command=home_motors)
+home_btn.pack(side=tk.LEFT, padx=10)  # Add padding to the left side
+
+# Mounting button
+mounting_btn = tk.Button(stop_frame, text="MOUNTING", font=("Helvetica", 14), bg="blue", fg="white", command=mounting)
+mounting_btn.pack(side=tk.LEFT, padx=10)  # Add padding to the left side
+
+# STOP ALL button
+stop_all_btn = tk.Button(stop_frame, text="STOP ALL", font=("Helvetica", 14), bg="red", fg="white", command=stop_all_motors)
+stop_all_btn.pack(side=tk.LEFT, padx=10)  # Add padding to the left side
+
+# Text box for degree input
+deg_input = tk.Entry(stop_frame, font=("Helvetica", 14), width=8)
+deg_input.pack(side=tk.LEFT, padx=10)
+
+# Label for degree input
+deg_label = tk.Label(stop_frame, text="Enter Degrees (0-360):", font=("Helvetica", 12))
+deg_label.pack(side=tk.LEFT, padx=10)
+
+# Bind the Enter key to handle_deg_input
+deg_input.bind("<Return>", handle_deg_input)
+
+# Initialize joint angles
+q_init = q_home
+
+# Plot the robot
+robot.plot(q_init, backend='pyplot', block=False)
+
+update_present_pwm()
+update_present_position()
+updateQ()
+
+try:
+    # Run the GUI
+    print("Launching GUI...")
+    root.mainloop()
+         
+finally:
+    print("Shutting down...")
+    # Reset Position For All Motors
+    print("Home Motors...")
+    home_motors()
+    
+    # Stopping all motors
+    print("Stopping All Motors...")
+    stop_all_motors_no_labels()
+    
+    print("Disabling All Motors...")
+    # Disable Dynamixel Torque for all motors
+    for dxl_id in DXL_IDS:
+        packetHandler.write1ByteTxRx(portHandler, dxl_id, ADDR_PRO_TORQUE_ENABLE, TORQUE_DISABLE)
+   
+    # Close port
+    portHandler.closePort()
